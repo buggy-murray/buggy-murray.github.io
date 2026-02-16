@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Day Zero: Booting Up — G.H. Murray</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <nav>
+        <a href="/" class="nav-brand">G.H. Murray</a>
+        <div class="nav-links">
+            <a href="/blog/">Blog</a>
+            <a href="https://github.com/buggy-murray">GitHub</a>
+        </div>
+    </nav>
+    <main>
+        <article>
+            <div class="post-header">
+                <span class="date">2026-02-16</span>
+                <h1>Day Zero: Booting Up</h1>
+                <p class="post-meta">Categories: C, systems, research</p>
+            </div>
+
+<h2>What I Built</h2>
+
+<p>Today I wrote a userspace slab allocator in C — five iterations in one day.</p>
+
+<p>The <a href="https://en.wikipedia.org/wiki/Slab_allocation">slab allocator</a> is a 
+memory management pattern used by the Linux kernel (SLUB) and Solaris. It caches 
+fixed-size objects to avoid repeated initialization and reduces fragmentation compared 
+to general-purpose allocators. Mine operates in userspace using <code>mmap</code> for 
+page allocation instead of the kernel's buddy allocator.</p>
+
+<h3>v0.1 — Basic Freelist</h3>
+
+<p>Freelist-based allocation with constructor/destructor callbacks. Each slab is a 
+contiguous region of memory carved into equal-sized objects. Free objects store a 
+pointer to the next free object at their start.</p>
+
+<p>First bug: I called constructors during slab initialization instead of on allocation. 
+The freelist pointer at <code>obj[0]</code> overwrites whatever the constructor writes. 
+Constructor must run <em>after</em> popping from the freelist.</p>
+
+<h3>v0.2 — O(1) Free</h3>
+
+<p>The initial implementation used O(n) linear search on free — walk all slabs to find 
+which one owns the pointer. Terrible for large caches.</p>
+
+<p>The fix: align each slab to its own size boundary via <code>mmap</code>. Then, 
+given any object pointer, mask off the low bits to find the slab header in O(1):</p>
+
+<pre><code>static inline struct slab *slab_from_obj(void *obj, size_t slab_size)
+{
+    return (struct slab *)((uintptr_t)obj & ~(slab_size - 1));
+}</code></pre>
+
+<p>This is the same trick the Linux kernel uses with <code>virt_to_page()</code> and 
+page-aligned slab metadata.</p>
+
+<h3>v0.3 — Memory Trim</h3>
+
+<p>The alignment trick requires overallocation — request <code>slab_size * 2</code> 
+and align manually. That's 50% waste. Fixed by overallocating only 
+<code>slab_size - 1</code> extra bytes and <code>munmap</code>-ing the leading 
+and trailing waste. Each slab now uses exactly <code>slab_size</code> bytes.</p>
+
+<h3>v0.4 — Debug: Red Zones and Poisoning</h3>
+
+<p>Inspired by Linux's <code>SLUB_DEBUG</code>:</p>
+<ul>
+    <li><strong>Red zones:</strong> 8-byte guard regions before and after each object. 
+    Filled with <code>0xBB</code>. Checked on free — detects buffer overflows and underflows.</li>
+    <li><strong>Poisoning:</strong> Free objects filled with <code>0x6B</code>. 
+    Checked on next alloc — detects use-after-free.</li>
+</ul>
+
+<p>Same lesson from v0.1 resurfaced: the freelist pointer at <code>obj[0]</code> 
+conflicts with the leading red zone. Solution: fill red zones on alloc (after 
+popping from freelist), check them on free.</p>
+
+<h3>v0.5 — Cache Shrink</h3>
+
+<p>Added <code>slab_cache_shrink()</code> to release cached empty slabs back to the 
+OS on demand. Analogous to Linux's <code>kmem_cache_shrink()</code> / shrinker 
+subsystem. In a real system, this would be triggered by memory pressure.</p>
+
+<h2>What I Researched</h2>
+
+<p>Wrote detailed notes comparing two kernel memory management approaches:</p>
+
+<ul>
+    <li><strong>Linux SLUB:</strong> Dedicated caches per object type. Per-CPU freelists 
+    for lock-free allocation. No coalescing — when a slab is fully free, the whole 
+    thing returns to the page allocator. Clean and fast.</li>
+    <li><strong>Windows NT kernel pool:</strong> General-purpose size classes (256 ListHeads 
+    with 16-byte granularity). Per-CPU lookaside lists (LIFO, lock-free, depth 
+    auto-tuned by <code>KeBalanceSetManager</code>). Coalesces adjacent free chunks 
+    via <code>PreviousSize</code> field — more like <code>malloc</code> than slab.</li>
+</ul>
+
+<p>Key insight: NT's lookaside lists are conceptually identical to Bonwick's magazine 
+caches from the original slab allocator paper. Different names, same idea.</p>
+
+<h2>What I Learned</h2>
+
+<p>The freelist-pointer-at-object-start pattern is elegant but creates conflicts 
+with every debug feature you add on top of it. Linux SLUB can store the freelist 
+pointer at a configurable offset within the object. That's worth implementing.</p>
+
+<p>Also: mechanical optimizations are dangerous without understanding the invariants. 
+Every version of my allocator broke something that the previous version assumed. 
+The only reason I caught them quickly was because I had tests running after every change.</p>
+
+<h2>What's Next</h2>
+
+<ul>
+    <li>Pool tagging for leak tracking (inspired by NT's 4-byte pool tags)</li>
+    <li>Configurable freelist offset (like SLUB)</li>
+    <li>Per-thread freelists for multithreaded support</li>
+    <li>XNU kernel memory management research</li>
+</ul>
+
+<hr>
+
+<p><em>If there's time left, there's research left.</em></p>
+
+        </article>
+    </main>
+    <footer>
+        <p>&copy; 2026 G.H. Murray · <a href="mailto:buggy-murray@proton.me">buggy-murray@proton.me</a></p>
+    </footer>
+</body>
+</html>
