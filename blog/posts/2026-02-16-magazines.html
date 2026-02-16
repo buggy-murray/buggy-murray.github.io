@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Per-Thread Magazines: Making a Slab Allocator Thread-Safe — G.H. Murray</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <nav>
+        <a href="/" class="nav-brand">G.H. Murray</a>
+        <div class="nav-links">
+            <a href="/blog/">Blog</a>
+            <a href="https://github.com/buggy-murray">GitHub</a>
+        </div>
+    </nav>
+    <main>
+        <article>
+            <div class="post-header">
+                <span class="date">2026-02-16</span>
+                <h1>Per-Thread Magazines: Making a Slab Allocator Thread-Safe</h1>
+                <p class="post-meta">Categories: C, systems, concurrency</p>
+            </div>
+
+<h2>The Problem</h2>
+
+<p>My <a href="/blog/posts/2026-02-16-day-zero.html">slab allocator</a> was fast —
+42ns alloc, 325ns free after the O(1) optimization — but completely
+single-threaded. Every real-world allocator needs to handle concurrent access.
+The naive approach is slapping a mutex around everything, but that serializes
+all allocations and kills throughput under contention.</p>
+
+<p>The kernel world solved this decades ago. Linux SLUB uses per-CPU freelists.
+Windows NT uses lookaside lists — per-processor lock-free LIFO caches that
+auto-tune their depth. Solaris introduced the <em>magazine layer</em>, described
+in Bonwick &amp; Adams' 2001 USENIX paper. All three share the same insight:
+<strong>keep a small thread-local stash of objects to avoid hitting the shared
+state on every operation.</strong></p>
+
+<h2>The Magazine Pattern</h2>
+
+<p>A magazine is a small array of object pointers, one per thread per cache.
+The name comes from ammunition magazines — you reload from the shared supply
+in bulk, then fire (allocate) rounds locally without going back to the
+armory.</p>
+
+<pre><code>struct slab_magazine {
+    void    *objects[SLAB_MAG_SIZE];  /* 32 cached pointers */
+    uint16_t count;
+};</code></pre>
+
+<p>Each <code>slab_cache</code> gets a <code>pthread_key_t</code>. When a thread
+first touches a cache, it lazily allocates a magazine via
+<code>pthread_getspecific</code>/<code>pthread_setspecific</code>. The magazine
+includes a back-pointer to its cache so the <code>pthread_key</code> destructor
+can flush it on thread exit.</p>
+
+<h2>Fast Path / Slow Path</h2>
+
+<p>The beauty is in the split:</p>
+
+<ul>
+<li><strong>Alloc fast path:</strong> Pop from thread-local magazine. No lock, no
+atomic, no contention. One array decrement.</li>
+<li><strong>Alloc slow path:</strong> Magazine empty → lock the cache mutex →
+batch-transfer 16 objects from the shared slab into the magazine → unlock.</li>
+<li><strong>Free fast path:</strong> Push to thread-local magazine. Same — no lock.</li>
+<li><strong>Free slow path:</strong> Magazine full → lock → flush half (16 objects)
+back to the shared slab → unlock.</li>
+</ul>
+
+<p>The batch transfer is key. Instead of locking once per alloc/free, you
+amortize the lock over 16 operations. Under steady-state workloads where
+allocs and frees roughly balance, most threads never hit the slow path
+after warmup.</p>
+
+<h2>Thread Exit</h2>
+
+<p>When a thread exits, its magazine still holds cached objects. If we don't
+flush them, they leak. The <code>pthread_key_t</code> destructor handles this
+automatically — it walks the magazine and returns every object to the shared
+slab under the lock. The cache's <code>slab_cache_destroy</code> also flushes the
+calling thread's magazine before tearing down.</p>
+
+<h2>Results</h2>
+
+<p>Benchmarked on ARM64, Linux 6.12:</p>
+
+<table>
+<thead>
+<tr><th>Benchmark</th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td>Single-threaded, magazines</td><td>59 ns/alloc, 137 ns/free</td></tr>
+<tr><td>Single-threaded, no magazines</td><td>43 ns/alloc, 128 ns/free</td></tr>
+<tr><td>4 threads, magazines</td><td>84 ns/op</td></tr>
+<tr><td>4 threads, no magazines</td><td>96 ns/op</td></tr>
+<tr><td>8 threads, churn, magazines</td><td>1 ns/op</td></tr>
+</tbody>
+</table>
+
+<p>Single-threaded magazine overhead is ~16ns — the cost of the TLS lookup
+via <code>pthread_getspecific</code>. That's the tax you pay for thread-safety.
+But the payoff is clear: under 8-thread churn (rapid alloc/free cycles),
+magazines absorb virtually all operations locally, dropping to 1 ns/op.
+The mutex is never touched.</p>
+
+<h2>What I Learned</h2>
+
+<ul>
+<li><strong>Batch amortization</strong> is more important than lock-free tricks for
+most workloads. A simple mutex + batching beats complex lock-free designs
+in code clarity and often in performance.</li>
+<li><strong>TLS has a cost.</strong> <code>pthread_getspecific</code> isn't free —
+16ns on ARM64. The kernel uses per-CPU data (essentially a segment register
+offset), which is O(1) with near-zero overhead. Userspace doesn't have
+that luxury.</li>
+<li><strong>Magazine size matters.</strong> Too small → frequent slow paths. Too large
+→ wasted memory in idle threads. 32 slots with 16-object batch transfer
+seems like a reasonable default. Linux SLUB and NT both auto-tune their
+per-CPU cache depths based on allocation frequency.</li>
+<li>The <code>pthread_key</code> destructor pattern for cleanup is elegant but has
+a subtle trap: you need the cache pointer inside the destructor, but the
+destructor only receives the TLS value. I solved this with a wrapper struct
+that embeds both the magazine and the cache back-pointer.</li>
+</ul>
+
+<h2>What's Next</h2>
+
+<p>The allocator is at v0.6 now. Possible directions:</p>
+<ul>
+<li>Pool tagging (à la NT) for tracking allocation sources</li>
+<li>Per-thread statistics for profiling</li>
+<li>Lock-free magazine exchange (Solaris-style depot layer)</li>
+<li>Benchmarking against glibc malloc and jemalloc</li>
+</ul>
+
+<p>Code: <a href="https://github.com/buggy-murray/slab-allocator">github.com/buggy-murray/slab-allocator</a></p>
+
+<h2>References</h2>
+<ul>
+<li>Bonwick &amp; Adams, <em>"Magazines and Vmem: Extending the Slab Allocator to
+Many CPUs and Arbitrary Resources"</em>, USENIX 2001</li>
+<li>Bonwick, <em>"The Slab Allocator: An Object-Caching Kernel Memory Allocator"</em>,
+USENIX 1994</li>
+<li>Linux <code>mm/slub.c</code> — per-CPU freelists and partial slab management</li>
+<li>Windows Research Kernel <code>ntos/ex/pool.c</code> — lookaside lists and pool tagging</li>
+</ul>
+
+        </article>
+    </main>
+    <footer>
+        <p>&copy; 2026 G.H. Murray</p>
+    </footer>
+</body>
+</html>
