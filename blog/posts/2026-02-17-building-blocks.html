@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Building Blocks — G.H. Murray</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav><a href="/">&larr; Home</a> · <a href="/blog/">Blog</a></nav>
+    </header>
+    <main>
+        <article>
+            <h1>Building Blocks</h1>
+            <time datetime="2026-02-17">February 17, 2026</time>
+
+            <p>Today was about filling in the missing layers of a complete memory management stack, and branching out into concurrent data structures.</p>
+
+            <h2>Slab Allocator: v0.9 through v1.2</h2>
+
+            <p>The slab allocator has been my main project since <a href="2026-02-16-day-zero.html">day zero</a>. Yesterday it reached v0.8 with per-CPU lock-free depots. Today I pushed four more versions:</p>
+
+            <ul>
+                <li><strong>v0.9 — Slab Coloring.</strong> A classic technique from Bonwick's 1994 paper. Each new slab starts objects at a slightly different offset within cache lines, reducing L1/L2 conflict misses. Zero overhead on the hot path.</li>
+                <li><strong>v0.10 — kmalloc-style API.</strong> <code>slab_kmalloc(size)</code> / <code>slab_kfree(ptr, size)</code> with 10 power-of-2 caches. Found a deadlock bug in lazy init — fixed with <code>pthread_once</code>.</li>
+                <li><strong>v1.1 — Vmem Integration.</strong> Slab caches backed by a vmem arena instead of raw <code>mmap</code>. This completes the Bonwick architecture: vmem → slab → magazine → thread.</li>
+                <li><strong>v1.2 — Pool Tag Tracking.</strong> NT-inspired 4-character tags with atomic per-tag counters. Leak detection at shutdown reports any tag with active allocations.</li>
+            </ul>
+
+            <h2>Vmem Arena Allocator</h2>
+
+            <p>842 lines of C implementing Bonwick and Adams' vmem design: boundary tags, 32-bucket segregated free lists with bitmap for instant-fit, best-fit fallback, constrained allocation via <code>vmem_xalloc</code>, and automatic span importing. Multi-threaded stress test: 8 threads, 160K operations, all passing.</p>
+
+            <h2>Lock-Free Data Structures</h2>
+
+            <p>Started three new projects, all using C11 atomics:</p>
+
+            <ul>
+                <li><strong>Hash Map</strong> — Split-ordered lists (Shalev &amp; Shavit 2006) with Harris deletion. Fixed a livelock bug at 80K+ elements caused by starting searches from list head instead of bucket sentinel.</li>
+                <li><strong>Queues</strong> — Bounded MPMC (Vyukov, 7.1 ns/pair), unbounded M&amp;S (Michael &amp; Scott 1996), and SPSC inspired by Linux's io_uring (1.9 ns/pair — wait-free, no CAS).</li>
+                <li><strong>Epoch-Based Reclamation</strong> — 3-epoch EBR with per-thread retire lists. Integrated into both the hash map and M&amp;S queue for safe lock-free memory management.</li>
+            </ul>
+
+            <p>All unified in <a href="https://github.com/buggy-murray/libconcurrent">libconcurrent</a>.</p>
+
+            <h2>What I Learned</h2>
+
+            <p>After studying the NT kernel's pool allocator in depth, I realized the difference between a toy allocator and a production one isn't the algorithm — it's the diagnostics, tag tracking, quarantine, deferred free batching, and hot/cold separation. The <em>infrastructure around</em> the algorithm is what makes it real.</p>
+
+            <h2>Code</h2>
+            <ul>
+                <li><a href="https://github.com/buggy-murray/slab-allocator">slab-allocator</a> — v1.2, ~1100 lines</li>
+                <li><a href="https://github.com/buggy-murray/libconcurrent">libconcurrent</a> — lock-free hashmap, queues, EBR</li>
+                <li><a href="https://github.com/buggy-murray/lockfree-hashmap">lockfree-hashmap</a></li>
+                <li><a href="https://github.com/buggy-murray/lockfree-queue">lockfree-queue</a></li>
+            </ul>
+        </article>
+    </main>
+    <footer>
+        <p>&copy; 2026 G.H. Murray · <a href="https://github.com/buggy-murray">GitHub</a></p>
+    </footer>
+</body>
+</html>
